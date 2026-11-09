@@ -3,6 +3,7 @@
 import fcntl
 import json
 import logging
+import math
 import os
 import socket
 import tempfile
@@ -86,13 +87,80 @@ def send(text):
                 raise RuntimeError('Relay reported delivery failure')
 
 
-def check_metrics():
+def cpu_snapshot(boot_id):
+    # On Linux psutil reads /proc/stat. guest times are already included in
+    # user/nice; counting them again would distort the utilization percentage.
+    counters = {key: value for key, value in psutil.cpu_times()._asdict().items()
+                if key not in ('guest', 'guest_nice')}
+    return {'boot_id': boot_id, 'monotonic': time.monotonic(),
+            'cpu_count': psutil.cpu_count() or 1, 'counters': counters}
+
+
+def cpu_average(previous, current):
+    """Return (busy percent, elapsed seconds), or None without a valid pair."""
+    if not isinstance(previous, dict):
+        return None
+    try:
+        if (previous['boot_id'] != current['boot_id'] or
+                previous['cpu_count'] != current['cpu_count']):
+            return None
+        elapsed = current['monotonic'] - previous['monotonic']
+        if not math.isfinite(elapsed) or elapsed < 1:
+            return None
+        before, after = previous['counters'], current['counters']
+        if before.keys() != after.keys():
+            return None
+        deltas = {}
+        for key, value in after.items():
+            delta = value - before[key]
+            if not math.isfinite(delta):
+                return None
+            # Linux iowait may decrease; clamp its delta as psutil does.
+            # Other regressions invalidate the baseline (reset/hotplug).
+            if delta < 0 and key != 'iowait':
+                return None
+            deltas[key] = max(0.0, delta)
+        total = sum(deltas.values())
+        if total <= 0:
+            return None
+        busy = total - deltas['idle'] - deltas.get('iowait', 0)
+        return max(0.0, min(100.0, busy / total * 100)), elapsed
+    except (KeyError, TypeError, AttributeError):
+        # A malformed or older saved snapshot should not stop RAM/disk checks.
+        return None
+
+
+def check_metrics(state, boot_id):
     metrics = {}
-    # One-second real sample (not the meaningless first non-blocking psutil result).
-    cpu = psutil.cpu_percent(interval=1)
-    metrics['cpu'] = (cpu >= cfg_float('CPU_MAX_PERCENT', 90),
-                      f'CPU: {cpu:.1f}% (порог {cfg_float("CPU_MAX_PERCENT", 90):g}%)',
-                      cfg_int('CPU_CONSECUTIVE_CHECKS', 3))
+    snapshot = cpu_snapshot(boot_id)
+    average = cpu_average(state.get('cpu_sample'), snapshot)
+    state['cpu_sample'] = snapshot
+    if average is None:
+        # Skip CPU only. Preserve an announced alert until a real interval can
+        # confirm recovery, and don't mix old instantaneous streaks with averages.
+        record = state.get('alerts', {}).get('cpu')
+        if record is not None:
+            record['streak'] = 0
+        logging.info('CPU average pending: baseline saved; waiting for next check')
+    else:
+        cpu, elapsed = average
+        interval = f'{elapsed / 60:.1f} мин' if elapsed >= 60 else f'{elapsed:.1f} с'
+        metrics['cpu'] = (cpu >= cfg_float('CPU_MAX_PERCENT', 90),
+                          f'CPU: {cpu:.1f}% в среднем за {interval} '
+                          f'(порог {cfg_float("CPU_MAX_PERCENT", 90):g}%)',
+                          cfg_int('CPU_CONSECUTIVE_CHECKS', 3))
+        logging.info('CPU average: %.1f%% over %.1f seconds', cpu, elapsed)
+    if cfg_int('CHECK_LOAD_AVERAGE', 1):
+        load5 = os.getloadavg()[1]
+        cpus = snapshot['cpu_count']
+        ratio = load5 / cpus
+        limit = cfg_float('LOAD5_MAX_PER_CPU', 1.0)
+        metrics['load5'] = (ratio >= limit,
+                            f'Load average (5 мин): {load5:.2f}, CPU: {cpus}; '
+                            f'{ratio:.2f} на CPU (порог {limit:g})',
+                            cfg_int('LOAD_CONSECUTIVE_CHECKS', 2))
+        logging.info('Load average (5 min): %.2f, %.2f per CPU (%d CPUs)',
+                     load5, ratio, cpus)
     mem = psutil.virtual_memory()
     metrics['ram'] = (mem.percent >= cfg_float('RAM_MAX_PERCENT', 90),
                       f'RAM: {mem.percent:.1f}% (свободно {mem.available / 1024**3:.1f} GB)',
@@ -150,7 +218,7 @@ def main():
             for val in state.get('alerts', {}).values():
                 val['streak'] = 0
         state['boot_id'] = boot_id
-        metrics = check_metrics()
+        metrics = check_metrics(state, boot_id)
         alerts = state.setdefault('alerts', {})
         new_problems, recoveries, reminders = [], [], []
         remind_secs = cfg_int('REMIND_EVERY_HOURS', 12) * 3600
