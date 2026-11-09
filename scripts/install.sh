@@ -47,13 +47,22 @@ TIMER_ACTIVE=0
 TIMER_ENABLED=0
 systemctl is-active --quiet ubuntu-monitor.timer && TIMER_ACTIVE=1
 systemctl is-enabled --quiet ubuntu-monitor.timer 2>/dev/null && TIMER_ENABLED=1
+stop_if_present() {
+    local load_state
+    load_state=$(systemctl show "$1" -p LoadState --value) || return
+    [[ -n $load_state ]] || { echo "Cannot determine LoadState of $1" >&2; return 1; }
+    # A fresh installation has no units yet. Errors stopping an existing unit
+    # must still abort deployment instead of being silently ignored.
+    if [[ $load_state != not-found ]]; then systemctl stop "$1"; fi
+}
 cleanup() {
     local status=$?
     trap - EXIT
     if (( SWITCHED && ! COMMITTED )); then
         set +e
         echo 'Deployment failed; restoring previous release and units.' >&2
-        systemctl stop ubuntu-monitor.timer ubuntu-monitor.service
+        stop_if_present ubuntu-monitor.timer
+        stop_if_present ubuntu-monitor.service
         if [[ -n $OLD_CURRENT ]]; then
             ln -sfn "$OLD_CURRENT" "$TARGET/current.next"
             mv -Tf "$TARGET/current.next" "$TARGET/current"
@@ -68,7 +77,11 @@ cleanup() {
             fi
         done
         systemctl daemon-reload
-        if (( TIMER_ENABLED )); then systemctl enable ubuntu-monitor.timer; else systemctl disable ubuntu-monitor.timer; fi
+        if (( TIMER_ENABLED )); then
+            systemctl enable ubuntu-monitor.timer
+        elif [[ $(systemctl show ubuntu-monitor.timer -p LoadState --value) != not-found ]]; then
+            systemctl disable ubuntu-monitor.timer
+        fi
         if (( TIMER_ACTIVE )); then systemctl start ubuntu-monitor.timer; fi
     fi
     if (( ! COMMITTED )); then rm -rf -- "$RELEASE"; fi
@@ -95,8 +108,8 @@ for unit in ubuntu-monitor.service ubuntu-monitor.timer; do
 done
 printf '%s\n' "$OLD_CURRENT" > "$BACKUP/previous-release"
 SWITCHED=1
-systemctl stop ubuntu-monitor.timer
-systemctl stop ubuntu-monitor.service
+stop_if_present ubuntu-monitor.timer
+stop_if_present ubuntu-monitor.service
 chmod 600 "$TARGET/.env"
 ln -s "$RELEASE" "$TARGET/current.next"
 mv -Tf "$TARGET/current.next" "$TARGET/current"
