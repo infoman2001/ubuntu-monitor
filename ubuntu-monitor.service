@@ -1,0 +1,19 @@
+[Unit]
+Description=Ubuntu health monitoring and Telegram relay alerts
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/ubuntu-monitor
+Environment=UBUNTU_MONITOR_HOME=/opt/ubuntu-monitor
+ExecStart=/opt/ubuntu-monitor/current/venv/bin/python /opt/ubuntu-monitor/current/monitor.py
+TimeoutStartSec=90
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/ubuntu-monitor
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

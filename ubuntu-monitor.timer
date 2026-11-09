@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Ubuntu server health every 5 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=5min
+AccuracySec=10s
+Unit=ubuntu-monitor.service
+
+[Install]
+WantedBy=timers.target
