@@ -15,10 +15,10 @@ flock -n 9 || { echo 'Another installation is running' >&2; exit 1; }
 install -d -m 755 "$TARGET" "$TARGET/releases"
 if [[ ! -f $TARGET/.env ]]; then
     install -m 600 "$SOURCE/.env.example" "$TARGET/.env"
-    echo "Created $TARGET/.env. Fill in relay credentials, then run this script again."
+    echo "Created $TARGET/.env. Fill in Telegram or relay settings, then run this script again."
     exit 0
 fi
-# Validate configuration without displaying values or contacting the relay.
+# Validate configuration without displaying values or contacting Telegram/relay.
 python3 - "$SOURCE" "$TARGET" <<'PY'
 import importlib.util
 import os
@@ -33,10 +33,7 @@ spec.loader.exec_module(monitor)
 for key in ('RELAY_URL', 'RELAY_AUTH', 'TG_TOKEN', 'TG_CHAT_ID'):
     os.environ.pop(key, None)
 monitor.load_env(Path(sys.argv[2]) / '.env')
-for key in ('RELAY_URL', 'RELAY_AUTH', 'TG_TOKEN', 'TG_CHAT_ID'):
-    value = os.getenv(key, '')
-    if not value or 'REPLACE_WITH_' in value or 'example.com' in value:
-        raise SystemExit(f'Configure {key} in /opt/ubuntu-monitor/.env')
+monitor.validate_config()
 PY
 RELEASE=$(mktemp -d "$TARGET/releases/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")
 SWITCHED=0

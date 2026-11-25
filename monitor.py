@@ -9,11 +9,15 @@ import socket
 import tempfile
 import time
 from datetime import datetime
+from http.client import HTTPException
 from pathlib import Path
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 import psutil
+
+__version__ = '1.1.0'
 
 BASE = Path(os.environ.get("UBUNTU_MONITOR_HOME", Path(__file__).resolve().parent))
 
@@ -65,26 +69,61 @@ def write_state(path, state):
             os.unlink(tmp)
 
 
+def validate_config():
+    relay_url = os.getenv('RELAY_URL', '').strip()
+    required = ['TG_TOKEN', 'TG_CHAT_ID']
+    if relay_url:
+        required.extend(('RELAY_URL', 'RELAY_AUTH'))
+    for key in required:
+        value = os.getenv(key, '').strip()
+        if not value or 'REPLACE_WITH_' in value:
+            raise RuntimeError(f'Configure {key} in .env')
+    if relay_url:
+        try:
+            parsed = urlsplit(relay_url)
+            valid = parsed.scheme in ('http', 'https') and bool(parsed.hostname)
+        except ValueError:
+            valid = False
+        if not valid or parsed.hostname == 'relay.example.com':
+            raise RuntimeError('Configure RELAY_URL in .env: expected an HTTP(S) URL')
+
+
 def send(text):
-    url = os.environ['RELAY_URL']
-    auth = os.environ['RELAY_AUTH']
-    token = os.environ['TG_TOKEN']
-    chat_id = os.environ['TG_CHAT_ID']
+    validate_config()
+    relay_url = os.getenv('RELAY_URL', '').strip()
+    token = os.environ['TG_TOKEN'].strip()
+    chat_id = os.environ['TG_CHAT_ID'].strip()
+    transport = 'Relay' if relay_url else 'Telegram'
+    url = relay_url or f'https://api.telegram.org/bot{token}/sendMessage'
+    headers = {'Content-Type': 'application/json; charset=utf-8'}
+    if relay_url:
+        headers.update({'X-Relay-Auth': os.environ['RELAY_AUTH'].strip(),
+                        'X-TG-Token': token})
+    timeout = cfg_float('RELAY_TIMEOUT_SEC' if relay_url else 'TG_TIMEOUT_SEC', 12)
     body = json.dumps({'text': text, 'chat_id': chat_id}, ensure_ascii=False).encode('utf-8')
-    request = Request(url, data=body, headers={
-        'Content-Type': 'application/json; charset=utf-8',
-        'X-Relay-Auth': auth,
-        'X-TG-Token': token,
-    }, method='POST')
-    with urlopen(request, timeout=cfg_float('RELAY_TIMEOUT_SEC', 12)) as response:
-        reply = response.read(8192).decode('utf-8', errors='replace')
-        if not 200 <= response.status < 300:
-            raise RuntimeError(f'Relay returned HTTP {response.status}')
-        # A HTTP 200 might still contain an application-level failure.
-        if reply.strip().startswith('{'):
+    try:
+        request = Request(url, data=body, headers=headers, method='POST')
+        with urlopen(request, timeout=timeout) as response:
+            if not 200 <= response.status < 300:
+                raise RuntimeError(f'{transport} returned HTTP {response.status}')
+            # Telegram echoes the message in JSON; allow enough room for UTF-8 text.
+            reply = response.read(65536).decode('utf-8', errors='replace')
+    except HTTPError as exc:
+        raise RuntimeError(f'{transport} returned HTTP {exc.code}') from None
+    except (OSError, ValueError, HTTPException) as exc:
+        # Telegram puts the token in the URL. Do not expose exception text,
+        # response bodies or chained exceptions containing that URL in logs.
+        raise RuntimeError(f'{transport} request failed ({type(exc).__name__})') from None
+    if not relay_url or reply.strip().startswith('{'):
+        try:
             parsed = json.loads(reply)
-            if parsed.get('ok') is False or parsed.get('success') is False:
-                raise RuntimeError('Relay reported delivery failure')
+        except ValueError:
+            raise RuntimeError(f'{transport} returned invalid JSON') from None
+        if not isinstance(parsed, dict):
+            raise RuntimeError(f'{transport} returned invalid JSON')
+        if ((not relay_url and parsed.get('ok') is not True) or
+                parsed.get('ok') is False or parsed.get('success') is False):
+            raise RuntimeError(f'{transport} reported delivery failure')
 
 
 def cpu_snapshot(boot_id):
@@ -193,9 +232,9 @@ def check_metrics(state, boot_id):
 
 def main():
     load_env(BASE / '.env')
-    for key in ('RELAY_URL', 'RELAY_AUTH', 'TG_TOKEN', 'TG_CHAT_ID'):
-        if not os.getenv(key):
-            raise RuntimeError(f'Missing required environment variable: {key}')
+    validate_config()
+    logging.info('Ubuntu Monitor %s; notifications via %s', __version__,
+                 'relay' if os.getenv('RELAY_URL', '').strip() else 'Telegram Bot API')
     state_path = BASE / 'state.json'
     lock_path = BASE / 'monitor.lock'
     with open(lock_path, 'a+', encoding='utf-8') as lock:
@@ -210,7 +249,7 @@ def main():
         boot_id = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
         first_run = 'boot_id' not in state
         rebooted = not first_run and state['boot_id'] != boot_id
-        # Maintain a pending event until the relay acknowledges the POST.
+        # Maintain a pending event until the selected transport acknowledges it.
         if rebooted:
             state['pending_boot'] = boot_id
             # Clear accumulated critical streak after a reboot; retain announced problems
@@ -242,7 +281,7 @@ def main():
             outgoing.append(('boot', '🔄 Сервер перезагрузился\n'
                 f'🖥 {host}\n🕒 Запущен: {started}\n'
                 f'⏱ Uptime: {int(now - psutil.boot_time()) // 60} мин'))
-        if first_run and cfg_int('NOTIFY_ON_FIRST_RUN', 1) and not state.get('first_run_sent'):
+        if cfg_int('NOTIFY_ON_FIRST_RUN', 1) and not state.get('first_run_sent'):
             outgoing.append(('startup', f'✅ Мониторинг запущен\n🖥 {host}'))
         if new_problems:
             outgoing.append(('new', '🚨 Проблемы на сервере\n🖥 ' + host + '\n\n' +
@@ -277,7 +316,7 @@ def main():
             write_state(state_path, state)
             logging.info('Sent %s notification', kind)
         if failed:
-            raise RuntimeError('Some relay notifications failed; will retry next run')
+            raise RuntimeError('Some notifications failed; will retry next run')
         logging.info('Checked %d metrics; %d notifications', len(metrics), len(outgoing))
 
 

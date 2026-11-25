@@ -1,5 +1,5 @@
 [Unit]
-Description=Ubuntu health monitoring and Telegram relay alerts
+Description=Ubuntu health monitoring and Telegram alerts
 Wants=network-online.target
 After=network-online.target
 

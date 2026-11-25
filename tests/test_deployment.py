@@ -110,6 +110,32 @@ exec {sys.executable} "$@"
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.target / 'current').exists())
 
+    def test_direct_config_without_relay_can_be_installed(self):
+        self.target.mkdir()
+        config = 'TG_TOKEN=123456:TEST_TOKEN\nTG_CHAT_ID=-100123456\n'
+        (self.target / '.env').write_text(config)
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.target / '.env').read_text(), config)
+        self.assertTrue((self.target / 'current/monitor.py').exists())
+
+    def test_relay_config_requires_auth_before_stopping_monitor(self):
+        self.configure_existing()
+        (self.target / '.env').write_text('TG_TOKEN=test\nTG_CHAT_ID=123\nRELAY_URL=https://relay.test/send\n')
+        result = self.run_install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('RELAY_AUTH', result.stderr)
+        self.assertFalse((self.root / 'systemctl.log').exists())
+
+    def test_invalid_relay_url_is_rejected_before_deployment(self):
+        self.configure_existing()
+        config = (self.target / '.env').read_text().replace('RELAY_URL=https:', 'RELAY_URL==https:')
+        (self.target / '.env').write_text(config)
+        result = self.run_install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('RELAY_URL', result.stderr)
+        self.assertFalse((self.root / 'systemctl.log').exists())
+
     def test_fresh_install_with_config_and_no_systemd_units(self):
         self.configure_existing()
         for unit in self.units.iterdir():
